@@ -9,10 +9,14 @@ from config import DB_FILE, TZ
 
 logger = logging.getLogger("status_tracker")
 
+# Global timezone instance (imported once)
+tz = pytz.timezone(TZ)
+
 
 async def init_db() -> None:
-    """Initialize SQLite database with required tables and indexes."""
+    """Initialize SQLite database with required tables, indexes and WAL mode."""
     async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS status_events (
@@ -27,10 +31,11 @@ async def init_db() -> None:
             )
             """
         )
+        # Index optimised for get_last_type() which ORDERs BY id DESC
         await db.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_user_time
-            ON status_events(user_id, timestamp)
+            CREATE INDEX IF NOT EXISTS idx_user_id
+            ON status_events(user_id, id DESC)
             """
         )
         await db.commit()
@@ -48,7 +53,9 @@ async def get_last_type(db: aiosqlite.Connection, user_id: int) -> str | None:
 
 async def log_status(
     db: aiosqlite.Connection,
-    user,
+    user_id: int,
+    first_name: str | None,
+    last_name: str | None,
     status_type: str,
     was_online: str | None = None,
     source: str = "unknown",
@@ -57,11 +64,10 @@ async def log_status(
     Log a status change if it differs from the last known status.
     Returns True if a new record was written, False if it was a duplicate.
     """
-    last = await get_last_type(db, user.id)
+    last = await get_last_type(db, user_id)
     if last == status_type:
         return False
 
-    tz = pytz.timezone(TZ)
     ts = datetime.now(tz).isoformat()
 
     await db.execute(
@@ -72,9 +78,9 @@ async def log_status(
         """,
         (
             ts,
-            user.id,
-            user.first_name,
-            user.last_name or "",
+            user_id,
+            first_name or "",
+            last_name or "",
             status_type,
             was_online,
             source,
@@ -82,7 +88,7 @@ async def log_status(
     )
     await db.commit()
 
-    name = f"{user.first_name} {user.last_name or ''}".strip()
+    name = f"{first_name or ''} {last_name or ''}".strip()
     extra = f" (last_seen={was_online})" if was_online else ""
-    logger.info(f"[{source:8s}] {name} ({user.id}): {status_type}{extra}")
+    logger.info(f"[{source:8s}] {name} ({user_id}): {status_type}{extra}")
     return True
