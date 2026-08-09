@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram Status Tracker
+Telegram Status Tracker — Multi-target edition
 
 Hybrid approach:
-  - Primary: Raw UpdateUserStatus listener (real-time)
-  - Fallback: Periodic polling (catches missed events after restart/disconnect)
+  - Primary: Raw UpdateUserStatus listener (real-time, filtered by type)
+  - Fallback: Periodic polling (round-robin, catches missed events)
 
+Supports up to 10 targets comfortably.
 Configuration is read from environment variables (see .env.example).
 """
 import asyncio
@@ -15,10 +16,27 @@ import sys
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
-from telethon.tl.types import UpdateUserStatus, UserStatusOnline, UserStatusOffline
+from telethon.tl.types import (
+    UpdateUserStatus,
+    UserStatusEmpty,
+    UserStatusLastMonth,
+    UserStatusLastWeek,
+    UserStatusOffline,
+    UserStatusOnline,
+    UserStatusRecently,
+)
 import aiosqlite
 
-from config import API_ID, API_HASH, PHONE, TARGET, DB_FILE, POLL_INTERVAL, TZ, validate
+from config import (
+    API_HASH,
+    API_ID,
+    DB_FILE,
+    PHONE,
+    POLL_INTERVAL,
+    TARGETS,
+    TZ,
+    validate,
+)
 from utils import init_db, log_status
 
 # --- Logging setup ---
@@ -29,79 +47,156 @@ logging.basicConfig(
 )
 logger = logging.getLogger("status_tracker")
 
+# Global timezone (import once, use everywhere)
+import pytz
 
-# --- Listener handler ---
-def build_listener(client: TelegramClient, db: aiosqlite.Connection, target_id: int):
-    """Build a raw update handler filtered for the target user."""
+tz = pytz.timezone(TZ)
+
+
+# ---------------------------------------------------------------------------
+# Target cache — avoids repeated get_entity() calls in the hot path
+# ---------------------------------------------------------------------------
+class TargetCache:
+    """Lightweight in-memory cache for resolved target entities."""
+
+    def __init__(self):
+        self._ids: set[int] = set()
+        self._names: dict[int, tuple[str, str]] = {}
+
+    def add(self, entity) -> None:
+        self._ids.add(entity.id)
+        fn = getattr(entity, "first_name", None) or ""
+        ln = getattr(entity, "last_name", None) or ""
+        self._names[entity.id] = (fn, ln)
+
+    def __contains__(self, user_id: int) -> bool:
+        return user_id in self._ids
+
+    def get_name(self, user_id: int) -> tuple[str, str]:
+        return self._names.get(user_id, ("Unknown", ""))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _classify_status(status):
+    """Return (status_type, was_online_or_extra)."""
+    if isinstance(status, UserStatusOnline):
+        extra = status.expires.astimezone(tz).isoformat() if status.expires else None
+        return "online", extra
+    if isinstance(status, UserStatusOffline):
+        was = status.was_online.astimezone(tz).isoformat() if status.was_online else None
+        return "offline", was
+    if isinstance(status, UserStatusRecently):
+        return "recently", None
+    if isinstance(status, UserStatusLastWeek):
+        return "last_week", None
+    if isinstance(status, UserStatusLastMonth):
+        return "last_month", None
+    if isinstance(status, UserStatusEmpty):
+        return "empty", None
+    return "hidden", None
+
+
+async def _resolve_targets(client: TelegramClient) -> tuple[TargetCache, list[str]]:
+    """Resolve every target string to a Telegram entity."""
+    cache = TargetCache()
+    failed: list[str] = []
+
+    for target in TARGETS:
+        try:
+            entity = await client.get_entity(target)
+            cache.add(entity)
+            logger.info(f"Resolved target: {entity.first_name} ({entity.id})")
+        except Exception as exc:
+            logger.error(f"Failed to resolve target '{target}': {exc}")
+            failed.append(target)
+
+    return cache, failed
+
+
+async def _snapshot_all(client: TelegramClient, cache: TargetCache, db: aiosqlite.Connection):
+    """Record the initial status for every resolved target."""
+    for target in TARGETS:
+        try:
+            user = await client.get_entity(target)
+            stype, extra = _classify_status(user.status)
+            fn, ln = cache.get_name(user.id)
+            await log_status(db, user.id, fn, ln, stype, extra, source="init")
+        except Exception as exc:
+            logger.warning(f"Initial snapshot failed for '{target}': {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Listener
+# ---------------------------------------------------------------------------
+def build_listener(cache: TargetCache, db: aiosqlite.Connection):
+    """Build a raw update handler filtered for our target users."""
 
     async def handler(event):
+        # Safety net — Telethon already filters by type, but we keep this
         if not isinstance(event, UpdateUserStatus):
             return
-        if event.user_id != target_id:
+        if event.user_id not in cache:
             return
 
-        status = event.status
-        if isinstance(status, UserStatusOnline):
-            stype, was = "online", None
-        elif isinstance(status, UserStatusOffline):
-            import pytz
-            tz = pytz.timezone(TZ)
-            was = status.was_online.astimezone(tz).isoformat() if status.was_online else None
-            stype = "offline"
-        else:
-            stype, was = "hidden", None
-
-        try:
-            user = await client.get_entity(event.user_id)
-            await log_status(db, user, stype, was, "listener")
-        except Exception as e:
-            logger.error(f"[listener] Error processing update for {event.user_id}: {e}")
+        stype, extra = _classify_status(event.status)
+        fn, ln = cache.get_name(event.user_id)
+        await log_status(db, event.user_id, fn, ln, stype, extra, source="listener")
 
     return handler
 
 
-# --- Fallback polling task ---
+# ---------------------------------------------------------------------------
+# Fallback polling
+# ---------------------------------------------------------------------------
 async def polling_task(
     client: TelegramClient,
+    cache: TargetCache,
     db: aiosqlite.Connection,
-    target_id: int,
-    target_input: str,
+    stop_event: asyncio.Event,
 ):
-    """Background task that periodically polls the target status."""
-    import pytz
-    tz = pytz.timezone(TZ)
-
-    while True:
+    """Background task that periodically polls every target."""
+    while not stop_event.is_set():
         try:
-            await asyncio.sleep(POLL_INTERVAL)
+            for target in TARGETS:
+                if stop_event.is_set():
+                    break
+                try:
+                    user = await client.get_entity(target)
+                except FloodWaitError as fwe:
+                    logger.warning(f"[poll] FloodWait — sleeping {fwe.seconds}s...")
+                    # Respect FloodWait but also check stop_event every second
+                    for _ in range(fwe.seconds):
+                        if stop_event.is_set():
+                            break
+                        await asyncio.sleep(1)
+                    continue
 
-            user = await client.get_entity(target_input)
-            status = user.status
-
-            if isinstance(status, UserStatusOnline):
-                stype, was = "online", None
-            elif isinstance(status, UserStatusOffline):
-                was = status.was_online.astimezone(tz).isoformat() if status.was_online else None
-                stype = "offline"
-            else:
-                stype, was = "hidden", None
-
-            await log_status(db, user, stype, was, "poll")
-
-        except FloodWaitError as e:
-            logger.warning(f"[poll] FloodWait — sleeping {e.seconds}s...")
-            await asyncio.sleep(e.seconds)
+                stype, extra = _classify_status(user.status)
+                fn, ln = cache.get_name(user.id)
+                await log_status(db, user.id, fn, ln, stype, extra, source="poll")
         except asyncio.CancelledError:
             break
-        except Exception as e:
-            logger.error(f"[poll] Error: {e}")
+        except Exception as exc:
+            logger.error(f"[poll] Error: {exc}")
+
+        # Sleep while remaining responsive to shutdown
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[poll] Task exiting.")
 
 
-# --- Main ---
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 async def main():
     missing = validate()
     if missing:
-        logger.error(f"Missing environment variables: {', '.join(missing)}")
+        logger.error(f"Missing or invalid config: {', '.join(missing)}")
         logger.error("Copy .env.example to .env and fill in your credentials.")
         sys.exit(1)
 
@@ -110,57 +205,47 @@ async def main():
     client = TelegramClient("status_tracker_session", API_ID, API_HASH)
     await client.start(PHONE)
 
-    # Resolve target once
-    try:
-        target_entity = await client.get_entity(TARGET)
-        target_id = target_entity.id
-        logger.info(f"Target: {target_entity.first_name} ({target_id})")
-    except Exception as e:
-        logger.error(f"Failed to resolve target '{TARGET}': {e}")
+    # Resolve all targets up-front
+    cache, failed = await _resolve_targets(client)
+    if not cache._ids:
+        logger.error("No targets could be resolved. Exiting.")
         await client.disconnect()
         sys.exit(1)
+    if failed:
+        logger.warning(f"Unresolved targets (will retry via polling): {failed}")
 
     db = await aiosqlite.connect(DB_FILE)
 
     # Initial snapshot so we know the starting state
-    try:
-        user = await client.get_entity(TARGET)
-        status = user.status
-        if isinstance(status, UserStatusOnline):
-            stype = "online"
-        elif isinstance(status, UserStatusOffline):
-            stype = "offline"
-        else:
-            stype = "hidden"
-        await log_status(db, user, stype, source="init")
-    except Exception as e:
-        logger.warning(f"Initial status check failed: {e}")
+    await _snapshot_all(client, cache, db)
 
-    # Register listener
-    listener = build_listener(client, db, target_id)
-    client.add_event_handler(listener, events.Raw)
+    # Register listener — filtered at the MTProto level so we only receive
+    # UpdateUserStatus updates, not every raw packet.
+    listener = build_listener(cache, db)
+    client.add_event_handler(listener, events.Raw(types=UpdateUserStatus))
 
-    # Start fallback polling
-    poll_task = asyncio.create_task(
-        polling_task(client, db, target_id, TARGET),
-        name="poll_fallback",
-    )
-
-    # Graceful shutdown
+    # Graceful shutdown machinery
     stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
-    def shutdown():
+    def _shutdown():
         logger.info("Shutdown signal received...")
         stop_event.set()
 
-    loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown)
+        loop.add_signal_handler(sig, _shutdown)
+
+    # Start fallback polling
+    poll_task = asyncio.create_task(
+        polling_task(client, cache, db, stop_event),
+        name="poll_fallback",
+    )
 
     logger.info(
-        "Tracker started. Listening for live updates + polling every %ds.",
-        POLL_INTERVAL,
+        f"Tracker started. Listening for live updates + polling every {POLL_INTERVAL}s. "
+        f"Targets: {len(cache._ids)}. Press Ctrl+C to stop."
     )
+
     await stop_event.wait()
 
     # Cleanup
@@ -171,7 +256,7 @@ async def main():
     except asyncio.CancelledError:
         pass
 
-    client.remove_event_handler(listener, events.Raw)
+    client.remove_event_handler(listener, events.Raw(types=UpdateUserStatus))
     await db.close()
     await client.disconnect()
     logger.info("Disconnected.")
